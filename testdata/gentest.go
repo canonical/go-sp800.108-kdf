@@ -6,8 +6,10 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"strings"
 	"unicode"
@@ -66,19 +68,12 @@ func scanTokens(data []byte, atEOF bool) (int, []byte, error) {
 	return adv + len(tok), tok, nil
 }
 
-type testCase struct {
-	l string
-	key string
-	iv string
-	fixed string
-	expected string
-}
+type testCase map[string]string
 
 type testSuite struct {
-	prf string
-	ctrLocation string
-	rlen string
-	tests []*testCase
+	name string
+	params map[string]string
+	tests []testCase
 }
 
 type stateFunc func(string) (stateFunc, error)
@@ -89,7 +84,7 @@ type parser struct {
 
 	suites []*testSuite
 	currentSuite *testSuite
-	currentTest *testCase
+	currentTest testCase
 	currentName string
 }
 
@@ -103,19 +98,7 @@ func (p *parser) handleEndTestCaseParam(tok string) (stateFunc, error) {
 }
 
 func (p *parser) handleTestCaseParam(tok string) (stateFunc, error) {
-	switch p.currentName {
-	case "L":
-		p.currentTest.l = tok
-	case "KI":
-		p.currentTest.key = tok
-	case "IV":
-		p.currentTest.iv = tok
-	case "FixedInputData":
-		p.currentTest.fixed = tok
-	case "KO":
-		p.currentTest.expected = tok
-	}
-
+	p.currentTest[p.currentName] = tok
 	return p.handleEndTestCaseParam, nil
 }
 
@@ -137,16 +120,23 @@ func (p *parser) handleEndTestSuiteParam(tok string) (stateFunc, error) {
 	}
 }
 
-func (p *parser) handleTestSuiteParam(tok string) (stateFunc, error) {
-	switch p.currentName {
-	case "PRF":
-		p.currentSuite.prf = tok
-	case "CTRLOCATION":
-		p.currentSuite.ctrLocation = tok
-	case "RLEN":
-		p.currentSuite.rlen = tok
+func (p *parser) handleEndTestSuiteName(tok string) (stateFunc, error) {
+	switch {
+	case tok == "]":
+		p.currentSuite.name = p.currentName
+		return p.handleEndTestSuiteParam(tok)
+	case tok == "=":
+		return p.handleEqual(tok)
+	default:
+		return nil, fmt.Errorf("handleEndTestSuiteName: unexpected token %v", tok)
 	}
+}
 
+func (p *parser) handleTestSuiteParam(tok string) (stateFunc, error) {
+	if p.currentSuite.name == "" {
+		p.currentSuite.name = tok
+	}
+	p.currentSuite.params[p.currentName] = tok
 	return p.handleEndTestSuiteParam, nil
 }
 
@@ -215,8 +205,27 @@ func (p *parser) handleStartTestSuiteParam(tok string) (stateFunc, error) {
 	case tok == "]" || tok == "=":
 		return nil, fmt.Errorf("handleStartTestSuiteParam: unexpected token %v", tok)
 	default:
-		p.currentTest = &testCase{}
+		p.currentTest = make(testCase)
 		return p.handleStartTestCaseParam(tok)
+	}
+}
+
+func (p *parser) handleStartTestSuiteName2(tok string) (stateFunc, error) {
+	switch {
+	case tok == "[" || tok == "]" || tok == "=" || tok == "\n":
+		return nil, fmt.Errorf("handleStartTestSuiteName2: unexpected token %v", tok)
+	default:
+		p.currentName = tok
+		return p.handleEndTestSuiteName, nil
+	}
+}
+
+func (p *parser) handleStartTestSuiteName(tok string) (stateFunc, error) {
+	switch {
+	case tok == "[":
+		return p.handleStartTestSuiteName2, nil
+	default:
+		return nil, fmt.Errorf("handleStartTestSuiteName: unexpected token %v", tok)
 	}
 }
 
@@ -225,16 +234,16 @@ func (p *parser) start(tok string) (stateFunc, error) {
 	case tok == "\n":
 		return nil, nil
 	case tok == "[":
-		p.currentSuite = &testSuite{}
+		p.currentSuite = &testSuite{params: make(map[string]string)}
 		p.suites = append(p.suites, p.currentSuite)
-		return p.handleStartTestSuiteParam(tok)
+		return p.handleStartTestSuiteName(tok)
 	case tok == "]" || tok == "=":
 		return nil, fmt.Errorf("start: unexpected token %v", tok)
 	default:
 		if p.currentSuite == nil {
 			return nil, fmt.Errorf("start: unexpected token %v (no current suite)", tok)
 		}
-		p.currentTest = &testCase{}
+		p.currentTest = make(testCase)
 		return p.handleStartTestCaseParam(tok)
 	}
 }
@@ -260,7 +269,9 @@ func newParser(r io.Reader) *parser {
 	return p
 }
 
-func generateTests(w io.Writer, vectors, ctrLocation, rlen, suiteTpl, testTpl string) error {
+var errSkipSuite = errors.New("")
+
+func generateTests(vectors string, filter map[string]string, emitSuite func(*testSuite, int) error, emitTest func(*testSuite, int, int, testCase) error) error {
 	f, err := os.Open(vectors)
 	if err != nil {
 		return err
@@ -272,55 +283,109 @@ func generateTests(w io.Writer, vectors, ctrLocation, rlen, suiteTpl, testTpl st
 		return err
 	}
 
-	for _, suite := range parser.suites {
-		if suite.ctrLocation != ctrLocation {
-			continue
+	for i, suite := range parser.suites {
+		skip := false
+		for k, v := range filter {
+			if suite.params[k] != v {
+				skip = true
+				break
+			}
 		}
-		if suite.rlen != rlen {
-			continue
-		}
-		newPrf, ok := prfs[suite.prf]
-		if !ok {
+
+		if skip {
 			continue
 		}
 
-		fmt.Fprintf(w, suiteTpl, suite.prf, newPrf)
+		if err := emitSuite(suite, i); err != nil {
+			if err == errSkipSuite {
+				continue
+			}
+			return err
+		}
 
-		for i, test := range suite.tests {
-			fmt.Fprintf(w, testTpl, suite.prf, i, test.key, test.fixed, test.iv, test.l, test.expected)
+		for j, test := range suite.tests {
+			if err := emitTest(suite, i, j, test); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
 
-func run(in io.Reader, out io.Writer) error {
-	if _, err := io.Copy(out, in); err != nil {
-		return fmt.Errorf("cannot copy test prologue: %v", err)
-	}
+type atomicFile struct {
+	*os.File
+	path string
+}
 
-	if err := generateTests(out, "testdata/KDFCTR_gen.rsp", "BEFORE_FIXED", "32_BITS", `
+func (f *atomicFile) Commit() error {
+	return os.Rename(f.Name(), f.path)
+}
+
+func (f *atomicFile) Close() error {
+	os.Remove(f.Name())
+	return f.File.Close()
+}
+
+func newAtomicFile(path string) (*atomicFile, error) {
+	f, err := ioutil.TempFile("", "gentest")
+	if err != nil {
+		return nil, fmt.Errorf("cannot create temporary file: %v", err)
+	}
+	return &atomicFile{f, path}, nil
+}
+
+func run(out io.Writer) error {
+	if err := generateTests("testdata/KDFCTR_gen.rsp", map[string]string{"CTRLOCATION":"BEFORE_FIXED", "RLEN":"32_BITS"},
+		func(suite *testSuite, _ int) error {
+			newPrf, ok := prfs[suite.params["PRF"]]
+			if !ok {
+				return errSkipSuite
+			}
+
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) testCounterMode%[1]s(c *C, data *testData) {
 	s.testCounterMode(c, %[2]s, data)
-}`, `
+}`,
+			suite.params["PRF"], newPrf)
+			return err
+		},
+		func(suite *testSuite, _, i int, test testCase) error {
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) TestCounterMode%[1]s_%[2]d(c *C) {
 	s.testCounterMode%[1]s(c, &testData{
 		key: decodeHexString(c, "%[3]s"),
 		fixed: decodeHexString(c, "%[4]s"),
-		bitLength: %[6]s,
-		expected: decodeHexString(c, "%[7]s"),
+		bitLength: %[5]s,
+		expected: decodeHexString(c, "%[6]s"),
 	})
-}`); err != nil {
-	return err
-}
+}`,
+			suite.params["PRF"], i, test["KI"], test["FixedInputData"], test["L"], test["KO"])
+			return err
+		},
+	); err != nil {
+		return err
+	}
 
-	if err := generateTests(out, "testdata/FeedbackModenocounter/KDFFeedback_gen.rsp", "", "", `
+	if err := generateTests("testdata/FeedbackModenocounter/KDFFeedback_gen.rsp", nil,
+		func(suite *testSuite, _ int) error {
+			newPrf, ok := prfs[suite.params["PRF"]]
+			if !ok {
+				return errSkipSuite
+			}
+
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) testFeedbackModeNoCounter%[1]s(c *C, data *testData) {
 	s.testFeedbackMode(c, %[2]s, data, false)
-}`, `
+}`,
+			suite.params["PRF"], newPrf)
+			return err
+		},
+		func(suite *testSuite, _, i int, test testCase) error {
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) TestFeedbackModeNoCounter%[1]s_%[2]d(c *C) {
 	s.testFeedbackModeNoCounter%[1]s(c, &testData{
@@ -330,15 +395,31 @@ func (s *kdfSuite) TestFeedbackModeNoCounter%[1]s_%[2]d(c *C) {
 		bitLength: %[6]s,
 		expected: decodeHexString(c, "%[7]s"),
 	})
-}`); err != nil {
-	return err
-}
+}`,
+			suite.params["PRF"], i, test["KI"], test["FixedInputData"], test["IV"], test["L"], test["KO"])
+			return err
+		},
+	); err != nil {
+		return err
+	}
 
-	if err := generateTests(out, "testdata/FeedbackModeNOzeroiv/KDFFeedback_gen.rsp", "AFTER_ITER", "32_BITS", `
+	if err := generateTests("testdata/FeedbackModeNOzeroiv/KDFFeedback_gen.rsp", map[string]string{"CTRLOCATION":"AFTER_ITER", "RLEN":"32_BITS"},
+		func(suite *testSuite, _ int) error {
+			newPrf, ok := prfs[suite.params["PRF"]]
+			if !ok {
+				return errSkipSuite
+			}
+
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) testFeedbackModeNoZeroIV%[1]s(c *C, data *testData) {
 	s.testFeedbackMode(c, %[2]s, data, true)
-}`, `
+}`,
+			suite.params["PRF"], newPrf)
+			return err
+		},
+		func(suite *testSuite, _, i int, test testCase) error {
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) TestFeedbackModeNoZeroIV%[1]s_%[2]d(c *C) {
 	s.testFeedbackModeNoZeroIV%[1]s(c, &testData{
@@ -348,15 +429,31 @@ func (s *kdfSuite) TestFeedbackModeNoZeroIV%[1]s_%[2]d(c *C) {
 		bitLength: %[6]s,
 		expected: decodeHexString(c, "%[7]s"),
 	})
-}`); err != nil {
-	return err
-}
+}`,
+			suite.params["PRF"], i, test["KI"], test["FixedInputData"], test["IV"], test["L"], test["KO"])
+			return err
+		},
+	); err != nil {
+		return err
+	}
 
-	if err := generateTests(out, "testdata/FeedbackModewzeroiv/KDFFeedback_gen.rsp", "AFTER_ITER", "32_BITS", `
+	if err := generateTests("testdata/FeedbackModewzeroiv/KDFFeedback_gen.rsp", map[string]string{"CTRLOCATION":"AFTER_ITER", "RLEN":"32_BITS"},
+		func(suite *testSuite, _ int) error {
+			newPrf, ok := prfs[suite.params["PRF"]]
+			if !ok {
+				return errSkipSuite
+			}
+
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) testFeedbackModeZeroIV%[1]s(c *C, data *testData) {
 	s.testFeedbackMode(c, %[2]s, data, true)
-}`, `
+}`,
+			suite.params["PRF"], newPrf)
+			return err
+		},
+		func(suite *testSuite, _, i int, test testCase) error {
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) TestFeedbackModeZeroIV%[1]s_%[2]d(c *C) {
 	s.testFeedbackModeZeroIV%[1]s(c, &testData{
@@ -366,69 +463,113 @@ func (s *kdfSuite) TestFeedbackModeZeroIV%[1]s_%[2]d(c *C) {
 		bitLength: %[6]s,
 		expected: decodeHexString(c, "%[7]s"),
 	})
-}`); err != nil {
-	return err
-}
+}`,
+			suite.params["PRF"], i, test["KI"], test["FixedInputData"], test["IV"], test["L"], test["KO"])
+			return err
+		},
+	); err != nil {
+		return err
+	}
 
-	if err := generateTests(out, "testdata/PipelineModewithCounter/KDFDblPipeline_gen.rsp", "AFTER_ITER", "32_BITS", `
+	if err := generateTests("testdata/PipelineModewithCounter/KDFDblPipeline_gen.rsp", map[string]string{"CTRLOCATION":"AFTER_ITER", "RLEN":"32_BITS"},
+		func(suite *testSuite, _ int) error {
+			newPrf, ok := prfs[suite.params["PRF"]]
+			if !ok {
+				return errSkipSuite
+			}
+
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) testPipelineMode%[1]s(c *C, data *testData) {
 	s.testPipelineMode(c, %[2]s, data, true)
-}`, `
+}`,
+			suite.params["PRF"], newPrf)
+			return err
+		},
+		func(suite *testSuite, _, i int, test testCase) error {
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) TestPipelineMode%[1]s_%[2]d(c *C) {
 	s.testPipelineMode%[1]s(c, &testData{
 		key: decodeHexString(c, "%[3]s"),
 		fixed: decodeHexString(c, "%[4]s"),
-		bitLength: %[6]s,
-		expected: decodeHexString(c, "%[7]s"),
+		bitLength: %[5]s,
+		expected: decodeHexString(c, "%[6]s"),
 	})
-}`); err != nil {
-	return err
-}
+}`,
+			suite.params["PRF"], i, test["KI"], test["FixedInputData"], test["L"], test["KO"])
+			return err
+		},
+	); err != nil {
+		return err
+	}
 
-	if err := generateTests(out, "testdata/PipelineModeWOCounterr/KDFDblPipeline_gen.rsp", "", "", `
+	if err := generateTests("testdata/PipelineModeWOCounterr/KDFDblPipeline_gen.rsp", nil,
+		func(suite *testSuite, _ int) error {
+			newPrf, ok := prfs[suite.params["PRF"]]
+			if !ok {
+				return errSkipSuite
+			}
+
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) testPipelineModeNoCounter%[1]s(c *C, data *testData) {
 	s.testPipelineMode(c, %[2]s, data, false)
-}`, `
+}`,
+			suite.params["PRF"], newPrf)
+			return err
+		},
+		func(suite *testSuite, _, i int, test testCase) error {
+			_, err := fmt.Fprintf(out, `
 
 func (s *kdfSuite) TestPipelineModeNoCounter%[1]s_%[2]d(c *C) {
 	s.testPipelineModeNoCounter%[1]s(c, &testData{
 		key: decodeHexString(c, "%[3]s"),
 		fixed: decodeHexString(c, "%[4]s"),
-		bitLength: %[6]s,
-		expected: decodeHexString(c, "%[7]s"),
+		bitLength: %[5]s,
+		expected: decodeHexString(c, "%[6]s"),
 	})
-}`); err != nil {
-	return err
-}
+}`,
+			suite.params["PRF"], i, test["KI"], test["FixedInputData"], test["L"], test["KO"])
+			return err
+		},
+	); err != nil {
+		return err
+	}
 
 	return nil
 }
 
 func main() {
-	src, err := os.Open("testdata/kdf_test.go.in")
+	tmpl, err := os.Open("testdata/kdf_test.go.in")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot open source file: %v\n")
+		fmt.Fprintf(os.Stderr, "Cannot open template file: %v\n")
 		os.Exit(1)
 	}
 
-	dst, err := os.OpenFile(".kdf_test.go", os.O_CREATE|os.O_RDWR, 0644)
+	dst, err := newAtomicFile("kdf_test.go")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot open destination file: %v\n")
 		os.Exit(1)
 	}
 
-	if err := run(src, dst); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Remove(dst.Name())
+	if _, err := io.Copy(dst, tmpl); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot copy template: %v\n", err)
+		dst.Close()
 		os.Exit(1)
 	}
 
-	if err := os.Rename(dst.Name(), "kdf_test.go"); err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot update destination file: %v\n")
-		os.Remove(dst.Name())
+	if err := run(dst); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		dst.Close()
 		os.Exit(1)
 	}
+
+	if err := dst.Commit(); err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot commit destination file: %v\n")
+		dst.Close()
+		os.Exit(1)
+	}
+
+	dst.Close()
 }
