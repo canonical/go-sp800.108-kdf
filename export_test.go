@@ -1,8 +1,8 @@
 package kdf
 
 var (
-	CounterModeKeyInternal = counterModeKeyInternal
+	CounterModeKeyInternal  = counterModeKeyInternal
 	FeedbackModeKeyInternal = feedbackModeKeyInternal
-	FixedBytes = fixedBytes
+	FixedBytes              = fixedBytes
 	PipelineModeKeyInternal = pipelineModeKeyInternal
 )
