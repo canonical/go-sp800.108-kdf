@@ -3,7 +3,10 @@
 // See LICENCE file for details.
 
 /*
-Package kdf implements the key derivation functions defined in NIST SP-800-108.
+Package kdf implements the key derivation functions described in NIST SP-800-108
+(see https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-108.pdf).
+
+All 3 modes are implemented - counter, feedback and pipeline.
 */
 package kdf
 
@@ -74,7 +77,7 @@ func counterModeKeyInternal(prf PRF, key, fixed []byte, bitLength uint32) []byte
 }
 
 // CounterModeKey derives a key of the specified length using the counter mode
-// function defined in NIST SP-800-108, using the supplied PRF, secret key and
+// function described in NIST SP-800-108, using the supplied PRF, secret key and
 // other input parameters.
 func CounterModeKey(prf PRF, key, label, context []byte, bitLength uint32) []byte {
 	return counterModeKeyInternal(prf, key, fixedBytes(label, context, bitLength), bitLength)
@@ -97,11 +100,11 @@ func feedbackModeKeyInternal(prf PRF, key, fixed, iv []byte, bitLength uint32, u
 }
 
 // FeebackModeKey derives a key of the specified length using the feedback mode
-// function defined in NIST SP-800-108, using the supplied PRF, secret key and
+// function described in NIST SP-800-108, using the supplied PRF, secret key and
 // other input parameters.
 //
 // The useCounter argument specifies whether the iteration counter should be
-// used as an input to the PRF.
+// included as an input to the PRF.
 func FeedbackModeKey(prf PRF, key, label, context, iv []byte, bitLength uint32, useCounter bool) []byte {
 	return feedbackModeKeyInternal(prf, key, fixedBytes(label, context, bitLength), iv, bitLength, useCounter)
 }
@@ -124,11 +127,11 @@ func pipelineModeKeyInternal(prf PRF, key, fixed []byte, bitLength uint32, useCo
 }
 
 // PipelineModeKey derives a key of the specified length using the double-pipeline
-// iteration mode function defined in NIST SP-800-108, using the supplied PRF,
+// iteration mode function described in NIST SP-800-108, using the supplied PRF,
 // secret key and other input parameters.
 //
 // The useCounter argument specifies whether the iteration counter should be
-// used as an input to the PRF.
+// included as an input to the PRF.
 func PipelineModeKey(prf PRF, key, label, context []byte, bitLength uint32, useCounter bool) []byte {
 	return pipelineModeKeyInternal(prf, key, fixedBytes(label, context, bitLength), bitLength, useCounter)
 }
