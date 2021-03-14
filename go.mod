@@ -1,4 +1,4 @@
-module github.com/chrisccoulson/go-sp800.108-kdf
+module github.com/canonical/go-sp800.108-kdf
 
 go 1.9
 

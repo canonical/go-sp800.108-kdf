@@ -14,7 +14,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	. "github.com/chrisccoulson/go-sp800.108-kdf"
+	. "github.com/canonical/go-sp800.108-kdf"
 
 	. "gopkg.in/check.v1"
 )
