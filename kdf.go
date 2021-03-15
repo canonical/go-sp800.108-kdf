@@ -27,23 +27,21 @@ type PRF interface {
 	Run(s, x []byte) []byte
 }
 
-type hmacPRF struct {
-	h crypto.Hash
-}
+type hmacPRF crypto.Hash
 
 func (p hmacPRF) Len() uint32 {
-	return uint32(p.h.Size())
+	return uint32(crypto.Hash(p).Size())
 }
 
 func (p hmacPRF) Run(s, x []byte) []byte {
-	h := hmac.New(func() hash.Hash { return p.h.New() }, s)
+	h := hmac.New(func() hash.Hash { return crypto.Hash(p).New() }, s)
 	h.Write(x)
 	return h.Sum(nil)
 }
 
 // NewHMACPRF creates a new HMAC based PRF using the supplied digest algorithm.
 func NewHMACPRF(h crypto.Hash) PRF {
-	return hmacPRF{h}
+	return hmacPRF(h)
 }
 
 func fixedBytes(label, context []byte, bitLength uint32) []byte {
